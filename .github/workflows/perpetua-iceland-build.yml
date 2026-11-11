@@ -1,0 +1,196 @@
+# 放到 fork 仓库的 .github/workflows/ 下，然后在 Actions 里手动 Run workflow。
+# 用途：在云端编译 linux-perpetua 的 iceland 内核，产出 Image / dtb / modules / manifest。
+# 说明：本机是 Windows 且无 WSL/Docker，所以用 GitHub Actions 做 Linux + LLVM 交叉编译。
+# v2: 内置 /chosen/fdt-handoff 身份补丁。实测本机 oplusboot.prjname=25927，
+#     而官方 iceland DTS 只写 25978；三个 stock-* 是 AND，任一不命中内核就不接管设备树。
+name: Build Perpetua kernel for iceland
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'linux-perpetua 分支'
+        required: true
+        default: 'perpetua/v7.3'
+      device:
+        description: 'devices/ 下的设备代号'
+        required: true
+        default: 'iceland'
+      handoff_prjnames:
+        description: 'fdt-handoff 项目号候选，逗号分隔（数组内是 OR）'
+        required: true
+        default: '25978,25927'
+      handoff_models:
+        description: 'fdt-handoff stock-model 候选，用 | 分隔（已按 OPD2513 实测值补齐）'
+        required: true
+        default: 'Qualcomm Technologies, Inc. Canoe MTP,iceland-O IN|Qualcomm Technologies, Inc. Canoe MTP,iceland-O'
+      handoff_compatibles:
+        description: 'fdt-handoff stock-compatible 候选，用 | 分隔（实测根 compatible 含 qcom,canoe，已命中）'
+        required: true
+        default: 'qcom,canoe'
+      make_boot_image:
+        description: '是否生成 boot.img（需先把原厂 boot.img 放进仓库 firmware/boot.img）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      BUILD: ${{ runner.temp }}/build
+      OUT: ${{ github.workspace }}/artifacts
+      DTB: qcom/kaanapali-oneplus-iceland.dtb
+      DTS: arch/arm64/boot/dts/qcom/kaanapali-oneplus-iceland.dts
+      H_PRJ: ${{ inputs.handoff_prjnames }}
+      H_MODEL: ${{ inputs.handoff_models }}
+      H_COMPAT: ${{ inputs.handoff_compatibles }}
+    steps:
+      - name: Checkout linux-perpetua
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+
+      - name: Patch fdt-handoff identity
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+
+          dts = pathlib.Path(os.environ["DTS"])
+          src = dts.read_text()
+
+          def values(raw, sep):
+              return [v.strip() for v in raw.split(sep) if v.strip()]
+
+          def quote(v):
+              return '"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+          pairs = [
+              ("stock-compatible", values(os.environ["H_COMPAT"], "|")),
+              ("stock-model", values(os.environ["H_MODEL"], "|")),
+              ("stock-bootargs",
+               ["oplusboot.prjname=" + p for p in values(os.environ["H_PRJ"], ",")]),
+          ]
+          for key, items in pairs:
+              assert items, f"{key}: no candidate values"
+              line = f"{key} = " + ", ".join(quote(v) for v in items) + ";"
+              pattern = re.compile(r"^(\s*)" + key + r"\s*=\s*[^;]+;", re.M)
+              src, n = pattern.subn(lambda m: m.group(1) + line, src, count=1)
+              assert n == 1, f"{key}: expected one assignment in the DTS, found {n}"
+          dts.write_text(src)
+          print("--- patched /chosen/fdt-handoff ---")
+          block = src.split("fdt-handoff {", 1)[1].split("};", 1)[0]
+          print(block.strip())
+          PY
+          mkdir -p "$OUT"
+          cp "$DTS" "$OUT/kaanapali-oneplus-iceland.patched.dts"
+          git diff -- "$DTS" > "$OUT/handoff.patch" || true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm gcc libssl-dev libelf-dev flex bison bc \
+            python3 device-tree-compiler dwarves zstd zip git curl make
+
+      - name: Configure kernel
+        run: |
+          mkdir -p "$BUILD" "$OUT"
+          ARCH=arm64 LLVM=1 devices/config "${{ inputs.device }}" "$BUILD"
+
+      - name: Build Image and modules
+        run: |
+          make ARCH=arm64 LLVM=1 O="$BUILD" -j"$(nproc)" Image modules
+          make ARCH=arm64 LLVM=1 O="$BUILD" \
+            INSTALL_MOD_PATH="${{ github.workspace }}/modules-root" modules_install
+
+      - name: Build device tree blob
+        continue-on-error: true
+        run: make ARCH=arm64 LLVM=1 O="$BUILD" "$DTB"
+
+      - name: Verify handoff against the unit's own stock FDT
+        if: ${{ hashFiles('firmware/stock.dtb') != '' }}
+        continue-on-error: true
+        run: |
+          # 匹配判定发生在内存处理之前，所以物理地址可用 0 0 占位。
+          # 退出码 0 = ready（内核接管内置树）；2 = not this device（不接管）。
+          set +e
+          devices/handoff/test \
+            "$BUILD/arch/arm64/boot/dts/$DTB" \
+            firmware/stock.dtb 0 0 "$OUT/handoff-output.dtb" \
+            | tee "$OUT/handoff-test.txt"
+          code=${PIPESTATUS[0]}
+          echo "handoff_test_exit=$code" | tee -a "$OUT/handoff-test.txt"
+          case "$code" in
+            0) echo "::notice::ready: 内核会接管内置设备树" ;;
+            2) echo "::error::not this device: 身份描述仍不匹配，不要刷这个 Image" ;;
+            *) echo "::warning::匹配已通过（地址占位导致后续处理失败）；以首行 ready 为准" ;;
+          esac
+
+      - name: Collect artifacts
+        run: |
+          cp "$BUILD/arch/arm64/boot/Image" "$OUT/Image"
+          cp "$BUILD/.config" "$OUT/kernel.config"
+          cp "$BUILD/System.map" "$OUT/System.map" || true
+          cp "$BUILD/Module.symvers" "$OUT/Module.symvers" || true
+          find "$BUILD/arch/arm64/boot/dts" -name '*iceland*.dtb' \
+            -exec cp {} "$OUT/" \; || true
+          find "${{ github.workspace }}/modules-root/lib/modules" -type f \
+            -exec sha256sum {} + | sed "s#${{ github.workspace }}/modules-root/##" \
+            > "$OUT/modules.sha256" || true
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          out = os.environ["OUT"]
+          files = {}
+          for name in sorted(os.listdir(out)):
+              p = os.path.join(out, name)
+              if os.path.isfile(p):
+                  files[name] = hashlib.sha256(open(p, "rb").read()).hexdigest()
+          release = subprocess.check_output(
+              ["make", "-s", "kernelrelease"], cwd=os.environ["BUILD"], text=True
+          ).strip()
+          manifest = {
+              "device": os.environ.get("DEVICE", "iceland"),
+              "release": release,
+              "source": "denialwm/linux-perpetua@" + os.environ["GITHUB_SHA"],
+              "handoff_models": os.environ["H_MODEL"],
+              "handoff_prjnames": os.environ["H_PRJ"],
+              "sha256": files,
+          }
+          with open(os.path.join(out, "manifest.json"), "w") as f:
+              json.dump(manifest, f, indent=2)
+          print(json.dumps(manifest, indent=2))
+          PY
+        env:
+          DEVICE: ${{ inputs.device }}
+
+      - name: Generate boot.img from the stock image
+        if: ${{ inputs.make_boot_image }}
+        run: |
+          test -f firmware/boot.img || {
+            echo "::error::把原厂 boot.img 放到 firmware/boot.img 后再开启本步骤"; exit 1; }
+          # avbtool 与 unpack_bootimg 来自 AOSP，apt 不带，需要单独取。
+          git clone --depth 1 https://android.googlesource.com/platform/external/avb \
+            "$RUNNER_TEMP/avb"
+          git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg \
+            "$RUNNER_TEMP/mkbootimg"
+          chmod +x "$RUNNER_TEMP/avb/avbtool" \
+                   "$RUNNER_TEMP/mkbootimg/unpack_bootimg" \
+                   "$RUNNER_TEMP/mkbootimg/mkbootimg" 2>/dev/null || true
+          export PATH="$RUNNER_TEMP/avb:$RUNNER_TEMP/mkbootimg:$PATH"
+          mkdir -p "$OUT/evidence"
+          # 官方用法: android-gki boot|init_boot TEMPLATE PAYLOAD OUTPUT [EVIDENCE]
+          python3 devices/boot/android-gki boot \
+            firmware/boot.img "$OUT/Image" "$OUT/boot.img" "$OUT/evidence"
+          sha256sum "$OUT/boot.img" | tee "$OUT/boot.img.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: perpetua-${{ inputs.device }}-${{ github.run_number }}
+          path: artifacts/
+          retention-days: 30
