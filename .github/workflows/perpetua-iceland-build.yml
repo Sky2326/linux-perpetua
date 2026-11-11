@@ -41,7 +41,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      BUILD: ${{ runner.temp }}/build
+      # `runner` is NOT available in jobs.<job_id>.env (GitHub: "Unrecognized
+      # named-value: 'runner'"). Keep the out-of-tree build outside the source
+      # tree, as devices/README does with ../build-iceland.
+      BUILD: ${{ github.workspace }}/../build-iceland
       OUT: ${{ github.workspace }}/artifacts
       DTB: qcom/kaanapali-oneplus-iceland.dtb
       DTS: arch/arm64/boot/dts/qcom/kaanapali-oneplus-iceland.dts
@@ -49,6 +52,12 @@ jobs:
       H_MODEL: ${{ inputs.handoff_models }}
       H_COMPAT: ${{ inputs.handoff_compatibles }}
     steps:
+      - name: Free runner disk space
+        run: |
+          # linux-perpetua is a full kernel tree; a stock ubuntu runner can run out mid-build.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          df -h
+
       - name: Checkout linux-perpetua
         uses: actions/checkout@v4
         with:
@@ -102,15 +111,16 @@ jobs:
           mkdir -p "$BUILD" "$OUT"
           ARCH=arm64 LLVM=1 devices/config "${{ inputs.device }}" "$BUILD"
 
+      - name: Build device tree blob
+        # Must exist before Image: CONFIG_BUILTIN_DTB_NAME links this dtb into
+        # the kernel. devices/check verifies dtb bytes are present in Image.
+        run: make ARCH=arm64 LLVM=1 O="$BUILD" "$DTB"
+
       - name: Build Image and modules
         run: |
           make ARCH=arm64 LLVM=1 O="$BUILD" -j"$(nproc)" Image modules
           make ARCH=arm64 LLVM=1 O="$BUILD" \
             INSTALL_MOD_PATH="${{ github.workspace }}/modules-root" modules_install
-
-      - name: Build device tree blob
-        continue-on-error: true
-        run: make ARCH=arm64 LLVM=1 O="$BUILD" "$DTB"
 
       - name: Verify handoff against the unit's own stock FDT
         if: ${{ hashFiles('firmware/stock.dtb') != '' }}
@@ -143,16 +153,18 @@ jobs:
             -exec sha256sum {} + | sed "s#${{ github.workspace }}/modules-root/##" \
             > "$OUT/modules.sha256" || true
           python3 - <<'PY'
-          import hashlib, json, os, subprocess
+          import hashlib, json, os
+          from pathlib import Path
           out = os.environ["OUT"]
           files = {}
           for name in sorted(os.listdir(out)):
               p = os.path.join(out, name)
               if os.path.isfile(p):
                   files[name] = hashlib.sha256(open(p, "rb").read()).hexdigest()
-          release = subprocess.check_output(
-              ["make", "-s", "kernelrelease"], cwd=os.environ["BUILD"], text=True
-          ).strip()
+          # The O= directory has no usable Makefile for a bare `make`; read the
+          # release Kbuild already wrote instead.
+          kr = Path(os.environ["BUILD"]) / "include/config/kernel.release"
+          release = kr.read_text().strip() if kr.is_file() else "unknown"
           manifest = {
               "device": os.environ.get("DEVICE", "iceland"),
               "release": release,
@@ -173,15 +185,24 @@ jobs:
         run: |
           test -f firmware/boot.img || {
             echo "::error::把原厂 boot.img 放到 firmware/boot.img 后再开启本步骤"; exit 1; }
-          # avbtool 与 unpack_bootimg 来自 AOSP，apt 不带，需要单独取。
-          git clone --depth 1 https://android.googlesource.com/platform/external/avb \
+          # avbtool / unpack_bootimg come from AOSP, not apt. Their real names
+          # are usually avbtool.py and unpack_bootimg.py, but android-gki calls
+          # them without the suffix. Build wrappers that work either way.
+          git clone --quiet --depth 1 https://android.googlesource.com/platform/external/avb \
             "$RUNNER_TEMP/avb"
-          git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg \
+          git clone --quiet --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg \
             "$RUNNER_TEMP/mkbootimg"
-          chmod +x "$RUNNER_TEMP/avb/avbtool" \
-                   "$RUNNER_TEMP/mkbootimg/unpack_bootimg" \
-                   "$RUNNER_TEMP/mkbootimg/mkbootimg" 2>/dev/null || true
-          export PATH="$RUNNER_TEMP/avb:$RUNNER_TEMP/mkbootimg:$PATH"
+          mkdir -p "$RUNNER_TEMP/bin"
+          AVB=$(ls "$RUNNER_TEMP/avb"/avbtool "$RUNNER_TEMP/avb"/avbtool.py 2>/dev/null | head -1)
+          UNPACK=$(ls "$RUNNER_TEMP/mkbootimg"/unpack_bootimg \
+                      "$RUNNER_TEMP/mkbootimg"/unpack_bootimg.py 2>/dev/null | head -1)
+          test -n "$AVB" || { echo "::error::avbtool missing from external/avb"; ls "$RUNNER_TEMP/avb"; exit 1; }
+          test -n "$UNPACK" || { echo "::error::unpack_bootimg missing from system/tools/mkbootimg"; ls "$RUNNER_TEMP/mkbootimg"; exit 1; }
+          printf '#!/bin/sh\nexec python3 "%s" "$@"\n' "$AVB" > "$RUNNER_TEMP/bin/avbtool"
+          printf '#!/bin/sh\nexec python3 "%s" "$@"\n' "$UNPACK" > "$RUNNER_TEMP/bin/unpack_bootimg"
+          chmod +x "$RUNNER_TEMP/bin/avbtool" "$RUNNER_TEMP/bin/unpack_bootimg"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          command -v avbtool && command -v unpack_bootimg
           mkdir -p "$OUT/evidence"
           # 官方用法: android-gki boot|init_boot TEMPLATE PAYLOAD OUTPUT [EVIDENCE]
           python3 devices/boot/android-gki boot \
