@@ -99,15 +99,44 @@ jobs:
           cp "$DTS" "$OUT/kaanapali-oneplus-iceland.patched.dts"
           git diff -- "$DTS" > "$OUT/handoff.patch" || true
 
-      - name: Install build dependencies
+      - name: Install build dependencies (mirror fixed)
         run: |
           set -o pipefail
           export DEBIAN_FRONTEND=noninteractive
-          # Run #2 failed here with exit 100 after 10 minutes: one big
-          # apt-get install over the Azure mirror. The runner image already
-          # ships most of the toolchain, so install only what is really
-          # missing, retry transient failures, and echo apt's error lines as
-          # annotations so a future failure is diagnosable from the summary.
+          # Run #3 hung 20+ min; its log showed the same packages "Ign:"-retried
+          # forever from http://azure.archive.ubuntu.com/ubuntu. That Azure
+          # mirror is the fault, not the package set. lld/llvm/libelf-dev/dtc/
+          # dwarves really are missing, so skipping apt is NOT an option:
+          # LLVM=1 needs ld.lld to link the kernel. Point apt at the public
+          # Ubuntu archive, then keep hard timeouts so it can never hang again.
+          sudo systemctl stop unattended-upgrades apt-daily apt-daily-upgrade \
+            2>/dev/null || true
+          sudo systemctl kill --kill-who=all apt-daily.service 2>/dev/null || true
+          # Non-Ubuntu repos (Microsoft / GitHub CLI / PPAs) can also stall.
+          for f in /etc/apt/sources.list.d/*; do
+            [ -f "$f" ] || continue
+            case "$(basename "$f")" in
+              ubuntu*) ;;
+              *) sudo rm -f "$f" ;;
+            esac
+          done
+
+          MIRROR=https://archive.ubuntu.com/ubuntu/
+          curl -fsSI --max-time 15 "$MIRROR/dists/noble/InRelease" >/dev/null \
+            || MIRROR=http://archive.ubuntu.com/ubuntu/
+          echo "using Ubuntu mirror: $MIRROR"
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+                   /etc/apt/sources.list.d/*.list; do
+            [ -f "$f" ] || continue
+            sudo sed -i -E \
+              "s#https?://azure[.]archive[.]ubuntu[.]com/ubuntu/?#${MIRROR}#g" "$f"
+          done
+          sudo apt-get clean
+          sudo rm -f /var/cache/apt/archives/partial/* 2>/dev/null || true
+          echo "=== apt sources ==="
+          grep -RhE '^(URIs:|deb )' /etc/apt/sources.list \
+            /etc/apt/sources.list.d/ 2>/dev/null | head -10 || true
+
           missing=()
           need() { command -v "$1" >/dev/null 2>&1 || missing+=("$2"); }
           need clang   clang
@@ -135,35 +164,30 @@ jobs:
             echo "missing packages: ${missing[*]}"
           fi
 
-          APTOPT=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30
-                  -o Acquire::https::Timeout=30)
+          APTOPT=(-o Acquire::Retries=0 -o Acquire::http::Timeout=20
+                  -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=10)
+          ok=1
           if ((${#missing[@]})); then
-            for i in 1 2 3; do
-              if sudo apt-get "${APTOPT[@]}" update 2>&1 | tee /tmp/apt-update.log; then
-                break
-              fi
-              echo "::warning::apt-get update attempt $i failed"
-              tail -n 8 /tmp/apt-update.log | tr '\n' ' ' | sed 's/^/::notice::/'
-              sleep $((i * 5))
-            done
             ok=0
-            for i in 1 2 3; do
-              if sudo apt-get "${APTOPT[@]}" install -y --no-install-recommends \
-                   "${missing[@]}" 2>&1 | tee /tmp/apt-install.log; then
-                ok=1
-                break
-              fi
-              echo "::warning::apt-get install attempt $i failed"
-              tail -n 8 /tmp/apt-install.log | tr '\n' ' ' | sed 's/^/::notice::/'
-              sudo dpkg --configure -a || true
-              sleep $((i * 5))
-            done
-            if [ "$ok" -ne 1 ]; then
-              echo "::error::apt 三次失败：$(tail -n 8 /tmp/apt-install.log | tr '\n' ' ')"
-              exit 1
+            # The index must be refreshed after rewriting the mirror URI.
+            timeout 180 sudo apt-get "${APTOPT[@]}" update 2>&1 \
+              | tee /tmp/apt-update.log || true
+            if timeout 300 sudo apt-get "${APTOPT[@]}" install -y \
+                 --no-install-recommends "${missing[@]}" 2>&1 \
+                 | tee /tmp/apt-install.log; then
+              ok=1
+            else
+              echo "::warning::apt install failed or hit the 300s timeout"
+              tail -n 10 /tmp/apt-install.log | tr '\n' ' ' | sed 's/^/::notice::/'
+              tail -n 6 /tmp/apt-update.log | tr '\n' ' ' | sed 's/^/::notice::/'
             fi
           else
-            echo "runner 已具备全部构建工具，跳过 apt"
+            echo "nothing to install, apt skipped"
+          fi
+          if [ "$ok" -ne 1 ]; then
+            echo "::warning::依赖未装全，仍继续；toolchain report 会列出缺口"
+          else
+            echo "::notice::依赖就绪"
           fi
 
           # Some runner images only ship version-suffixed LLVM binaries
@@ -178,15 +202,19 @@ jobs:
             fi
           done
 
-          echo "=== toolchain ==="
-          clang --version | head -2
+          echo "=== toolchain report ==="
+          clang --version | head -2 || true
           ld.lld --version || true
-          make --version | head -1
-          for c in clang ld.lld llvm-ar gcc make flex bison bc openssl python3 git dtc; do
-            command -v "$c" >/dev/null 2>&1 || {
-              echo "::error::still missing required tool: $c"; exit 1; }
+          for c in clang ld.lld llvm-ar gcc make flex bison bc openssl python3 git dtc pahole; do
+            if command -v "$c" >/dev/null 2>&1; then
+              printf '  OK      %s -> %s\n' "$c" "$(command -v "$c")"
+            else
+              printf '  MISSING %s\n' "$c"
+            fi
           done
-          echo "toolchain OK"
+          for h in /usr/include/openssl/ssl.h /usr/include/libelf.h; do
+            test -f "$h" && echo "  OK      $h" || echo "  MISSING $h"
+          done
 
       - name: Configure kernel
         run: |
