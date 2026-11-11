@@ -59,7 +59,7 @@ jobs:
           df -h
 
       - name: Checkout linux-perpetua
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.branch }}
           fetch-depth: 1
@@ -101,10 +101,92 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang lld llvm gcc libssl-dev libelf-dev flex bison bc \
-            python3 device-tree-compiler dwarves zstd zip git curl make
+          set -o pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # Run #2 failed here with exit 100 after 10 minutes: one big
+          # apt-get install over the Azure mirror. The runner image already
+          # ships most of the toolchain, so install only what is really
+          # missing, retry transient failures, and echo apt's error lines as
+          # annotations so a future failure is diagnosable from the summary.
+          missing=()
+          need() { command -v "$1" >/dev/null 2>&1 || missing+=("$2"); }
+          need clang   clang
+          need ld.lld  lld
+          need llvm-ar llvm
+          need gcc     gcc
+          need make    make
+          need flex    flex
+          need bison   bison
+          need bc      bc
+          need openssl openssl
+          need python3 python3
+          need git     git
+          need curl    curl
+          need zip     zip
+          need zstd    zstd
+          need dtc     device-tree-compiler
+          need pahole  dwarves
+          need depmod  kmod
+          need cpio    cpio
+          test -f /usr/include/openssl/ssl.h || missing+=(libssl-dev)
+          test -f /usr/include/libelf.h      || missing+=(libelf-dev)
+          if ((${#missing[@]})); then
+            mapfile -t missing < <(printf '%s\n' "${missing[@]}" | sort -u)
+            echo "missing packages: ${missing[*]}"
+          fi
+
+          APTOPT=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30
+                  -o Acquire::https::Timeout=30)
+          if ((${#missing[@]})); then
+            for i in 1 2 3; do
+              if sudo apt-get "${APTOPT[@]}" update 2>&1 | tee /tmp/apt-update.log; then
+                break
+              fi
+              echo "::warning::apt-get update attempt $i failed"
+              tail -n 8 /tmp/apt-update.log | tr '\n' ' ' | sed 's/^/::notice::/'
+              sleep $((i * 5))
+            done
+            ok=0
+            for i in 1 2 3; do
+              if sudo apt-get "${APTOPT[@]}" install -y --no-install-recommends \
+                   "${missing[@]}" 2>&1 | tee /tmp/apt-install.log; then
+                ok=1
+                break
+              fi
+              echo "::warning::apt-get install attempt $i failed"
+              tail -n 8 /tmp/apt-install.log | tr '\n' ' ' | sed 's/^/::notice::/'
+              sudo dpkg --configure -a || true
+              sleep $((i * 5))
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::error::apt 三次失败：$(tail -n 8 /tmp/apt-install.log | tr '\n' ' ')"
+              exit 1
+            fi
+          else
+            echo "runner 已具备全部构建工具，跳过 apt"
+          fi
+
+          # Some runner images only ship version-suffixed LLVM binaries
+          # (llvm-ar-18, ...); LLVM=1 expects the unsuffixed names.
+          for t in ar nm objcopy objdump strip readelf; do
+            if ! command -v "llvm-$t" >/dev/null 2>&1; then
+              cand=$(ls /usr/bin/llvm-"$t"-[0-9]* /usr/lib/llvm-*/bin/llvm-"$t" \
+                     2>/dev/null | head -1)
+              if [ -n "$cand" ]; then
+                sudo ln -sf "$cand" "/usr/local/bin/llvm-$t"
+              fi
+            fi
+          done
+
+          echo "=== toolchain ==="
+          clang --version | head -2
+          ld.lld --version || true
+          make --version | head -1
+          for c in clang ld.lld llvm-ar gcc make flex bison bc openssl python3 git dtc; do
+            command -v "$c" >/dev/null 2>&1 || {
+              echo "::error::still missing required tool: $c"; exit 1; }
+          done
+          echo "toolchain OK"
 
       - name: Configure kernel
         run: |
@@ -152,6 +234,10 @@ jobs:
           find "${{ github.workspace }}/modules-root/lib/modules" -type f \
             -exec sha256sum {} + | sed "s#${{ github.workspace }}/modules-root/##" \
             > "$OUT/modules.sha256" || true
+          # Perpetua ships no rootfs: these modules must be copied into
+          # /usr/lib/modules of the system image at the same kernel release.
+          tar --zstd -cf "$OUT/modules.tar.zst" \
+            -C "${{ github.workspace }}/modules-root/lib" modules || true
           python3 - <<'PY'
           import hashlib, json, os
           from pathlib import Path
@@ -210,7 +296,7 @@ jobs:
           sha256sum "$OUT/boot.img" | tee "$OUT/boot.img.sha256"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: perpetua-${{ inputs.device }}-${{ github.run_number }}
           path: artifacts/
