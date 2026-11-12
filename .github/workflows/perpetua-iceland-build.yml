@@ -3,6 +3,11 @@
 # 说明：本机是 Windows 且无 WSL/Docker，所以用 GitHub Actions 做 Linux + LLVM 交叉编译。
 # v2: 内置 /chosen/fdt-handoff 身份补丁。实测本机 oplusboot.prjname=25927，
 #     而官方 iceland DTS 只写 25978；三个 stock-* 是 AND，任一不命中内核就不接管设备树。
+# v2.8: run#6 暴露真实报错 "Linker is too old / Your LLD version: 16.0.6 /
+#     Minimum LLD version: 17.0.1"。原因是软链用 head -1 选中了最老的
+#     ld.lld-16，且 /usr/local/bin 会遮蔽 apt 新装的 ld.lld。现改为始终对齐
+#     镜像上最高版本 LLVM，必要时从第三方镜像装 lld-18，并在 configure 前
+#     做版本断言（<17 直接 fail-fast）。
 name: Build Perpetua kernel for iceland
 
 on:
@@ -188,26 +193,37 @@ jobs:
           sudo apt-get clean
           sudo rm -f /var/cache/apt/archives/partial/* 2>/dev/null || true
 
-          # Runner images often ship versioned LLVM tools only. Link them
-          # BEFORE deciding what apt must install -- otherwise we download
-          # lld/llvm that is already sitting on disk.
-          for t in ar nm objcopy objdump strip readelf; do
-            if ! command -v "llvm-$t" >/dev/null 2>&1; then
-              cand=$(ls /usr/bin/llvm-"$t"-[0-9]* /usr/lib/llvm-*/bin/llvm-"$t" \
-                     2>/dev/null | head -1)
-              if [ -n "$cand" ]; then
-                sudo ln -sf "$cand" "/usr/local/bin/llvm-$t"
-              fi
-            fi
-          done
-          if ! command -v ld.lld >/dev/null 2>&1; then
-            cand=$(ls /usr/bin/ld.lld-[0-9]* /usr/lib/llvm-*/bin/ld.lld \
-                   2>/dev/null | head -1)
-            if [ -n "$cand" ]; then
-              sudo ln -sf "$cand" /usr/local/bin/ld.lld
-              echo "linked ld.lld -> $cand"
-            fi
-          fi
+          # run#6 root cause: `ls ld.lld-[0-9]* | head -1` picked the OLDEST
+          # linker on the image (/usr/bin/ld.lld-16 = LLD 16.0.6) while clang
+          # is 18.1.3. /usr/local/bin shadows /usr/bin, so even a freshly
+          # installed lld would have been ignored. Kconfig requires
+          # LLD >= 17.0.1 and failed with "Sorry, this linker is not supported."
+          # Always align the unsuffixed tools to the HIGHEST LLVM on disk.
+          align_llvm() {
+            local v p best=0 lld="" t src
+            for v in 22 21 20 19 18 17 16 15 14; do
+              for p in "/usr/bin/ld.lld-$v" "/usr/lib/llvm-$v/bin/ld.lld"; do
+                if [ -x "$p" ] && [ "$v" -gt "$best" ]; then best=$v; lld=$p; fi
+              done
+            done
+            [ -n "$lld" ] || return 1
+            sudo ln -sf "$lld" /usr/local/bin/ld.lld
+            for t in ar nm objcopy objdump strip readelf; do
+              for src in "/usr/bin/llvm-$t-$best" "/usr/lib/llvm-$best/bin/llvm-$t"; do
+                if [ -x "$src" ]; then
+                  sudo ln -sf "$src" "/usr/local/bin/llvm-$t"
+                  break
+                fi
+              done
+            done
+            echo "aligned LLVM tools to $best via $lld"
+            echo "::notice::aligned LLVM tools to $best via $lld"
+          }
+          lld_major() {
+            ld.lld --version 2>/dev/null \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | cut -d. -f1
+          }
+          align_llvm || echo "::warning::no versioned ld.lld yet; apt will install one"
 
           missing=()
           need() { command -v "$1" >/dev/null 2>&1 || missing+=("$2"); }
@@ -231,6 +247,14 @@ jobs:
           need cpio    cpio
           test -f /usr/include/openssl/ssl.h || missing+=(libssl-dev)
           test -f /usr/include/libelf.h      || missing+=(libelf-dev)
+          # An old ld.lld is NOT solved by the bare `lld` metapackage: the
+          # stale /usr/local/bin/ld.lld symlink would keep shadowing it.
+          # Explicitly request lld-18 from the selected third-party noble mirror.
+          cur_major=$(lld_major || true)
+          if [ -z "$cur_major" ] || [ "$cur_major" -lt 17 ]; then
+            echo "::notice::LLD ${cur_major:-missing} < 17; requesting lld-18"
+            missing+=(lld-18)
+          fi
           if ((${#missing[@]})); then
             mapfile -t missing < <(printf '%s\n' "${missing[@]}" | sort -u)
             echo "missing packages: ${missing[*]}"
@@ -279,24 +303,14 @@ jobs:
             echo "::notice::依赖就绪"
           fi
 
-          # Re-scan once more: packages just installed by apt may only expose
-          # version-suffixed names. Idempotent with the pre-apt pass above.
-          for t in ar nm objcopy objdump strip readelf; do
-            if ! command -v "llvm-$t" >/dev/null 2>&1; then
-              cand=$(ls /usr/bin/llvm-"$t"-[0-9]* /usr/lib/llvm-*/bin/llvm-"$t" \
-                     2>/dev/null | head -1)
-              if [ -n "$cand" ]; then
-                sudo ln -sf "$cand" "/usr/local/bin/llvm-$t"
-              fi
-            fi
-          done
-          if ! command -v ld.lld >/dev/null 2>&1; then
-            cand=$(ls /usr/bin/ld.lld-[0-9]* /usr/lib/llvm-*/bin/ld.lld \
-                   2>/dev/null | head -1)
-            if [ -n "$cand" ]; then
-              sudo ln -sf "$cand" /usr/local/bin/ld.lld
-              echo "linked ld.lld -> $cand"
-            fi
+          # Re-align after apt: lld-18 may have just landed. Fail fast here
+          # instead of letting Configure kernel die with another bare exit 2.
+          align_llvm || { echo "::error::no ld.lld available after apt"; exit 1; }
+          final_major=$(lld_major || true)
+          echo "::notice::ld.lld -> $(readlink -f "$(command -v ld.lld)") | $(ld.lld --version | head -1)"
+          if [ -z "$final_major" ] || [ "$final_major" -lt 17 ]; then
+            echo "::error::LLD ${final_major:-missing} < 17.0.1 required by this kernel; abort before configure"
+            exit 1
           fi
 
           echo "=== toolchain report ==="
