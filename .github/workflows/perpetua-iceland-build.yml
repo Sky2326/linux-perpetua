@@ -325,18 +325,23 @@ jobs:
         run: |
           mkdir -p "$BUILD" "$OUT"
           set +e
-          ARCH=arm64 LLVM=1 devices/config "${{ inputs.device }}" "$BUILD"
+          # devices/config only redirects merge_config.sh's STDOUT into
+          # devices-config.log. make's real error goes to STDERR and was lost,
+          # which is why run#5 showed nothing but a bare "exit 2" even though
+          # all dependencies were installed. Capture both streams here.
+          ARCH=arm64 LLVM=1 devices/config "${{ inputs.device }}" "$BUILD" \
+            > "$BUILD/configure-stdout.log" 2> "$BUILD/configure-stderr.log"
           rc=$?
           set -e
+          cat "$BUILD/configure-stderr.log" || true
           if [ "$rc" -ne 0 ]; then
             echo "::error::devices/config failed with exit $rc"
-            # devices/config redirects merge_config.sh output to this file,
-            # so without echoing it the Actions log only shows a bare exit 2.
-            if [ -f "$BUILD/devices-config.log" ]; then
-              echo "=== devices-config.log (tail) ==="
-              tail -n 60 "$BUILD/devices-config.log" | \
-                while IFS= read -r line; do echo "::notice::$line"; done
-            fi
+            for f in configure-stderr.log devices-config.log configure-stdout.log; do
+              p="$BUILD/$f"
+              [ -f "$p" ] || continue
+              echo "=== $f (tail) ==="
+              tail -n 80 "$p" | while IFS= read -r line; do echo "::notice::$line"; done
+            done
             ls -l "$BUILD/.config" 2>/dev/null || echo "no .config produced"
             exit "$rc"
           fi
