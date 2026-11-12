@@ -99,43 +99,115 @@ jobs:
           cp "$DTS" "$OUT/kaanapali-oneplus-iceland.patched.dts"
           git diff -- "$DTS" > "$OUT/handoff.patch" || true
 
-      - name: Install build dependencies (mirror fixed)
+      - name: Install build dependencies (third-party mirrors)
         run: |
           set -o pipefail
           export DEBIAN_FRONTEND=noninteractive
-          # Run #3 hung 20+ min; its log showed the same packages "Ign:"-retried
-          # forever from http://azure.archive.ubuntu.com/ubuntu. That Azure
-          # mirror is the fault, not the package set. lld/llvm/libelf-dev/dtc/
-          # dwarves really are missing, so skipping apt is NOT an option:
-          # LLVM=1 needs ld.lld to link the kernel. Point apt at the public
-          # Ubuntu archive, then keep hard timeouts so it can never hang again.
+          # Run #4: v2.4 rewrote sources.list*, but Ubuntu 24.04 hosted runners
+          # use "mirror+file:/etc/apt/apt-mirrors.txt" -- the Azure hostname is
+          # inside THAT file, so apt still failed with "Temporary failure
+          # resolving 'azure.archive.ubuntu.com'". lld/llvm/flex/bison never
+          # installed, and Configure kernel then died with exit 2.
+          # v2.5: ignore every system source and hand apt one explicit list.
+          # v2.6: user asked for NO Ubuntu-owned mirrors at all, so the list
+          # is built from a probed third-party mirror, with no fallback to
+          # archive.ubuntu.com / azure.archive.ubuntu.com under any condition.
           sudo systemctl stop unattended-upgrades apt-daily apt-daily-upgrade \
             2>/dev/null || true
           sudo systemctl kill --kill-who=all apt-daily.service 2>/dev/null || true
-          # Non-Ubuntu repos (Microsoft / GitHub CLI / PPAs) can also stall.
-          for f in /etc/apt/sources.list.d/*; do
-            [ -f "$f" ] || continue
-            case "$(basename "$f")" in
-              ubuntu*) ;;
-              *) sudo rm -f "$f" ;;
+
+          # User asked to stop using Ubuntu's own mirrors entirely: no
+          # archive.ubuntu.com, no azure.archive.ubuntu.com, no fallback to
+          # either. Probe independent third-party mirrors and pick the fastest
+          # one that answers on THIS runner. GitHub-hosted runners sit in
+          # Azure US, so a CN mirror that is fast from China may not be fast
+          # there -- never hard-code a single mirror.
+          CANDIDATES=(
+            https://mirrors.aliyun.com/ubuntu/
+            https://mirrors.cloud.tencent.com/ubuntu/
+            https://repo.huaweicloud.com/ubuntu/
+            https://mirrors.tuna.tsinghua.edu.cn/ubuntu/
+            https://mirrors.ustc.edu.cn/ubuntu/
+            https://mirrors.mit.edu/ubuntu/
+            https://ubuntu.mirrors.ovh.net/ubuntu/
+          )
+          : > /tmp/mirror-ok.txt
+          probe_summary=""
+          for u in "${CANDIDATES[@]}"; do
+            out=$(curl -sS --connect-timeout 5 --max-time 10 \
+              -o /dev/null -w "%{http_code} %{time_total}" \
+              "${u}dists/noble/InRelease" 2>/dev/null) || out="000 99"
+            code=${out%% *}
+            tm=${out##* }
+            [ -n "$code" ] || code=000
+            case "$code" in
+              200) echo "$tm $u" >> /tmp/mirror-ok.txt
+                   probe_summary="$probe_summary ${u##*//}:OK/${tm}s" ;;
+              *)   probe_summary="$probe_summary ${u##*//}:FAIL/$code" ;;
             esac
           done
+          echo "mirror probe:$probe_summary"
+          echo "::notice::mirror probe:$probe_summary"
+          BASE=
+          if [ -s /tmp/mirror-ok.txt ]; then
+            BASE=$(sort -n /tmp/mirror-ok.txt | head -1 | awk '{print $2}')
+          fi
+          if [ -z "$BASE" ]; then
+            echo "::error::所有第三方镜像均不可达；按你的要求不回退 Ubuntu 官方源"
+            echo "::error::请在 CANDIDATES 里补一个该 runner 能访问的镜像后重跑"
+          else
+            echo "selected Ubuntu mirror: $BASE (fastest responding)"
+            echo "::notice::selected Ubuntu mirror: $BASE"
+          fi
 
-          MIRROR=https://archive.ubuntu.com/ubuntu/
-          curl -fsSI --max-time 15 "$MIRROR/dists/noble/InRelease" >/dev/null \
-            || MIRROR=http://archive.ubuntu.com/ubuntu/
-          echo "using Ubuntu mirror: $MIRROR"
-          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
-                   /etc/apt/sources.list.d/*.list; do
-            [ -f "$f" ] || continue
-            sudo sed -i -E \
-              "s#https?://azure[.]archive[.]ubuntu[.]com/ubuntu/?#${MIRROR}#g" "$f"
-          done
+          # One explicit isolated list: system sources (including the broken
+          # mirror+file:/etc/apt/apt-mirrors.txt) are never consulted.
+          write_sources() {
+            local comps=("$@")
+            : > /tmp/ubuntu-thirdparty.list
+            for c in "${comps[@]}"; do
+              printf 'deb [trusted=yes] %s %s main restricted universe multiverse\n' \
+                "$BASE" "$c" >> /tmp/ubuntu-thirdparty.list
+            done
+            cat /tmp/ubuntu-thirdparty.list
+          }
+          # trusted=yes: one-shot CI runner, avoids keyring/path differences
+          # between deb822 and legacy .list sources.
+          if [ -n "$BASE" ]; then
+            write_sources noble noble-updates noble-security
+          else
+            : > /tmp/ubuntu-thirdparty.list
+          fi
+          APT_SRC=(-o Dir::Etc::sourcelist=/tmp/ubuntu-thirdparty.list
+                  -o Dir::Etc::sourceparts=-
+                  -o APT::Get::List-Cleanup=0)
+          # Drop every cached index: stale Azure entries would otherwise make
+          # apt fetch packages from azure.archive.ubuntu.com again.
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo mkdir -p /var/lib/apt/lists/partial
           sudo apt-get clean
           sudo rm -f /var/cache/apt/archives/partial/* 2>/dev/null || true
-          echo "=== apt sources ==="
-          grep -RhE '^(URIs:|deb )' /etc/apt/sources.list \
-            /etc/apt/sources.list.d/ 2>/dev/null | head -10 || true
+
+          # Runner images often ship versioned LLVM tools only. Link them
+          # BEFORE deciding what apt must install -- otherwise we download
+          # lld/llvm that is already sitting on disk.
+          for t in ar nm objcopy objdump strip readelf; do
+            if ! command -v "llvm-$t" >/dev/null 2>&1; then
+              cand=$(ls /usr/bin/llvm-"$t"-[0-9]* /usr/lib/llvm-*/bin/llvm-"$t" \
+                     2>/dev/null | head -1)
+              if [ -n "$cand" ]; then
+                sudo ln -sf "$cand" "/usr/local/bin/llvm-$t"
+              fi
+            fi
+          done
+          if ! command -v ld.lld >/dev/null 2>&1; then
+            cand=$(ls /usr/bin/ld.lld-[0-9]* /usr/lib/llvm-*/bin/ld.lld \
+                   2>/dev/null | head -1)
+            if [ -n "$cand" ]; then
+              sudo ln -sf "$cand" /usr/local/bin/ld.lld
+              echo "linked ld.lld -> $cand"
+            fi
+          fi
 
           missing=()
           need() { command -v "$1" >/dev/null 2>&1 || missing+=("$2"); }
@@ -167,20 +239,37 @@ jobs:
           APTOPT=(-o Acquire::Retries=0 -o Acquire::http::Timeout=20
                   -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=10)
           ok=1
-          if ((${#missing[@]})); then
+          if ((${#missing[@]})) && [ -n "$BASE" ]; then
             ok=0
-            # The index must be refreshed after rewriting the mirror URI.
-            timeout 180 sudo apt-get "${APTOPT[@]}" update 2>&1 \
-              | tee /tmp/apt-update.log || true
-            if timeout 300 sudo apt-get "${APTOPT[@]}" install -y \
-                 --no-install-recommends "${missing[@]}" 2>&1 \
-                 | tee /tmp/apt-install.log; then
-              ok=1
+            update_ok=0
+            # Fresh index from the isolated third-party list only.
+            if timeout 180 sudo apt-get "${APT_SRC[@]}" "${APTOPT[@]}" update \
+                 2>&1 | tee /tmp/apt-update.log; then
+              update_ok=1
             else
-              echo "::warning::apt install failed or hit the 300s timeout"
-              tail -n 10 /tmp/apt-install.log | tr '\n' ' ' | sed 's/^/::notice::/'
+              echo "::warning::apt update 失败，去掉 noble-security 组件重试"
               tail -n 6 /tmp/apt-update.log | tr '\n' ' ' | sed 's/^/::notice::/'
+              write_sources noble noble-updates
+              if timeout 180 sudo apt-get "${APT_SRC[@]}" "${APTOPT[@]}" update \
+                   2>&1 | tee /tmp/apt-update.log; then
+                update_ok=1
+              else
+                tail -n 6 /tmp/apt-update.log | tr '\n' ' ' | sed 's/^/::notice::/'
+              fi
             fi
+            if [ "$update_ok" -eq 1 ]; then
+              if timeout 300 sudo apt-get "${APT_SRC[@]}" "${APTOPT[@]}" \
+                   install -y --no-install-recommends "${missing[@]}" 2>&1 \
+                   | tee /tmp/apt-install.log; then
+                ok=1
+              else
+                echo "::warning::apt install failed or hit the 300s timeout"
+                tail -n 10 /tmp/apt-install.log | tr '\n' ' ' | sed 's/^/::notice::/'
+              fi
+            fi
+          elif ((${#missing[@]})); then
+            ok=0
+            echo "::warning::无可用第三方镜像，跳过 apt；缺口见 toolchain report"
           else
             echo "nothing to install, apt skipped"
           fi
@@ -190,8 +279,8 @@ jobs:
             echo "::notice::依赖就绪"
           fi
 
-          # Some runner images only ship version-suffixed LLVM binaries
-          # (llvm-ar-18, ...); LLVM=1 expects the unsuffixed names.
+          # Re-scan once more: packages just installed by apt may only expose
+          # version-suffixed names. Idempotent with the pre-apt pass above.
           for t in ar nm objcopy objdump strip readelf; do
             if ! command -v "llvm-$t" >/dev/null 2>&1; then
               cand=$(ls /usr/bin/llvm-"$t"-[0-9]* /usr/lib/llvm-*/bin/llvm-"$t" \
@@ -201,25 +290,57 @@ jobs:
               fi
             fi
           done
+          if ! command -v ld.lld >/dev/null 2>&1; then
+            cand=$(ls /usr/bin/ld.lld-[0-9]* /usr/lib/llvm-*/bin/ld.lld \
+                   2>/dev/null | head -1)
+            if [ -n "$cand" ]; then
+              sudo ln -sf "$cand" /usr/local/bin/ld.lld
+              echo "linked ld.lld -> $cand"
+            fi
+          fi
 
           echo "=== toolchain report ==="
           clang --version | head -2 || true
           ld.lld --version || true
+          # Emit MISSING as annotations: job logs need admin rights to read,
+          # but check-run annotations are visible to everyone (and to me).
           for c in clang ld.lld llvm-ar gcc make flex bison bc openssl python3 git dtc pahole; do
             if command -v "$c" >/dev/null 2>&1; then
               printf '  OK      %s -> %s\n' "$c" "$(command -v "$c")"
             else
               printf '  MISSING %s\n' "$c"
+              echo "::warning::missing tool: $c"
             fi
           done
           for h in /usr/include/openssl/ssl.h /usr/include/libelf.h; do
-            test -f "$h" && echo "  OK      $h" || echo "  MISSING $h"
+            if [ -f "$h" ]; then
+              echo "  OK      $h"
+            else
+              echo "  MISSING $h"
+              echo "::warning::missing header: $h"
+            fi
           done
 
       - name: Configure kernel
         run: |
           mkdir -p "$BUILD" "$OUT"
+          set +e
           ARCH=arm64 LLVM=1 devices/config "${{ inputs.device }}" "$BUILD"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::devices/config failed with exit $rc"
+            # devices/config redirects merge_config.sh output to this file,
+            # so without echoing it the Actions log only shows a bare exit 2.
+            if [ -f "$BUILD/devices-config.log" ]; then
+              echo "=== devices-config.log (tail) ==="
+              tail -n 60 "$BUILD/devices-config.log" | \
+                while IFS= read -r line; do echo "::notice::$line"; done
+            fi
+            ls -l "$BUILD/.config" 2>/dev/null || echo "no .config produced"
+            exit "$rc"
+          fi
+          echo "kernel config generated"
 
       - name: Build device tree blob
         # Must exist before Image: CONFIG_BUILTIN_DTB_NAME links this dtb into
